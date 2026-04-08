@@ -1,0 +1,6 @@
+@bringeri_api_HostAddress = http://localhost:5011
+
+GET {{bringeri_api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
