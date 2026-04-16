@@ -31,7 +31,7 @@ public class InvoiceBatchesController : ControllerBase
         }
         catch (InvalidOperationException ex)
         {
-            return BadRequest(new { message = ex.Message });
+            return CorrelatedBadRequest(ex.Message);
         }
     }
 
@@ -50,7 +50,7 @@ public class InvoiceBatchesController : ControllerBase
         }
         catch (InvalidOperationException ex)
         {
-            return BadRequest(new { message = ex.Message });
+            return CorrelatedBadRequest(ex.Message);
         }
     }
 
@@ -92,7 +92,7 @@ public class InvoiceBatchesController : ControllerBase
         }
         catch (InvalidOperationException ex)
         {
-            return BadRequest(new { message = ex.Message });
+            return CorrelatedBadRequest(ex.Message);
         }
     }
 
@@ -128,5 +128,15 @@ public class InvoiceBatchesController : ControllerBase
         });
 
         return payload ?? throw new InvalidOperationException("Invoice batch request payload was invalid.");
+    }
+
+    private BadRequestObjectResult CorrelatedBadRequest(string message)
+    {
+        Response.Headers["X-Correlation-ID"] = HttpContext.TraceIdentifier;
+        return BadRequest(new
+        {
+            message,
+            correlationId = HttpContext.TraceIdentifier,
+        });
     }
 }

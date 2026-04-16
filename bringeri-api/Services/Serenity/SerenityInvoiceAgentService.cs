@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -10,20 +11,32 @@ namespace bringeri_api.Services.Serenity;
 public class SerenityInvoiceAgentService : ISerenityInvoiceAgentService
 {
     private const string ApiKeyEnvironmentName = "INVOICE_SERENITY_API_KEY";
+    private static readonly TimeSpan UploadTimeout = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan AnalysisTimeout = TimeSpan.FromSeconds(165);
+    private static readonly TimeSpan ExecuteReadinessRetryDelay = TimeSpan.FromMilliseconds(500);
+    private const int ExecuteReadinessMaxAttempts = 3;
+    private const int MaxBodySnippetLength = 600;
+    private const string GenericPreviewFailureMessage = "Unable to analyze one or more invoices. Please verify the file and retry.";
 
     private readonly HttpClient _httpClient;
     private readonly IConfiguration _configuration;
+    private readonly ILogger<SerenityInvoiceAgentService> _logger;
 
-    public SerenityInvoiceAgentService(HttpClient httpClient, IConfiguration configuration)
+    public SerenityInvoiceAgentService(HttpClient httpClient, IConfiguration configuration, ILogger<SerenityInvoiceAgentService> logger)
     {
         _httpClient = httpClient;
         _configuration = configuration;
+        _logger = logger;
     }
 
     public async Task<InvoiceEditorDto> AnalyzeInvoiceAsync(IFormFile file, CancellationToken cancellationToken = default)
     {
+        _logger.LogInformation("[SerenityAnalyzeStart] FileName={FileName} FileSize={FileSize}", file.FileName, file.Length);
+
         var knowledgeId = await UploadFileAsync(file, cancellationToken);
         var analysis = await ExecuteAnalysisAsync(knowledgeId, cancellationToken);
+
+        _logger.LogInformation("[SerenityAnalyzeSuccess] FileName={FileName} KnowledgeId={KnowledgeId}", file.FileName, knowledgeId);
 
         return BuildEditorDto(file, analysis.document.RootElement, analysis.rawResponse);
     }
@@ -44,18 +57,45 @@ public class SerenityInvoiceAgentService : ISerenityInvoiceAgentService
 
         request.Headers.Add("X-API-KEY", ResolveApiKey());
 
-        using var response = await _httpClient.SendAsync(request, cancellationToken);
-        response.EnsureSuccessStatusCode();
+        using var operationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        operationCts.CancelAfter(UploadTimeout);
 
-        var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
-        using var document = JsonDocument.Parse(responseBody);
-
-        if (!document.RootElement.TryGetProperty("id", out var idElement))
+        HttpResponseMessage response;
+        try
         {
-            throw new InvalidOperationException("Serenity upload response did not include an id.");
+            response = await _httpClient.SendAsync(request, operationCts.Token);
+        }
+        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new HttpRequestException("Serenity upload request timed out.", ex);
         }
 
-        return idElement.GetString() ?? throw new InvalidOperationException("Serenity upload id was empty.");
+        using (response)
+        {
+            await EnsureSuccessOrThrowAsync(response, "Upload", cancellationToken);
+
+            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+            JsonDocument document;
+            try
+            {
+                document = JsonDocument.Parse(responseBody);
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "[SerenityUploadParseFailure] BodySnippet={BodySnippet}", TruncateForLog(responseBody));
+                throw new InvalidOperationException(GenericPreviewFailureMessage, ex);
+            }
+
+            using (document)
+            {
+                if (!document.RootElement.TryGetProperty("id", out var idElement))
+                {
+                    throw new InvalidOperationException("Unable to analyze one or more invoices. Serenity upload did not return a file id.");
+                }
+
+                return idElement.GetString() ?? throw new InvalidOperationException("Unable to analyze one or more invoices. Serenity upload id was empty.");
+            }
+        }
     }
 
     private async Task<(JsonDocument document, string rawResponse)> ExecuteAnalysisAsync(string knowledgeId, CancellationToken cancellationToken)
@@ -69,36 +109,93 @@ public class SerenityInvoiceAgentService : ISerenityInvoiceAgentService
             },
         };
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, "agent/InvoiceBridge/execute")
+        for (var attempt = 1; attempt <= ExecuteReadinessMaxAttempts; attempt++)
         {
-            Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"),
-        };
-
-        request.Headers.Add("X-API-KEY", ResolveApiKey());
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
-        using var outer = JsonDocument.Parse(responseBody);
-
-        if (outer.RootElement.TryGetProperty("jsonContent", out var jsonContentElement)
-            && jsonContentElement.ValueKind == JsonValueKind.Object)
-        {
-            return (JsonDocument.Parse(jsonContentElement.GetRawText()), responseBody);
-        }
-
-        if (outer.RootElement.TryGetProperty("content", out var contentElement)
-            && contentElement.ValueKind == JsonValueKind.String)
-        {
-            var content = contentElement.GetString();
-            if (!string.IsNullOrWhiteSpace(content))
+            using var request = new HttpRequestMessage(HttpMethod.Post, "agent/InvoiceBridge/execute")
             {
-                return (JsonDocument.Parse(content), responseBody);
+                Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"),
+            };
+
+            request.Headers.Add("X-API-KEY", ResolveApiKey());
+
+            using var operationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            operationCts.CancelAfter(AnalysisTimeout);
+
+            HttpResponseMessage response;
+            try
+            {
+                response = await _httpClient.SendAsync(request, operationCts.Token);
+            }
+            catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                throw new HttpRequestException("Serenity analysis request timed out.", ex);
+            }
+
+            using (response)
+            {
+                var responseBody = await SafeReadBodyAsync(response, cancellationToken);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    if (attempt < ExecuteReadinessMaxAttempts
+                        && IsTransientExecuteReadinessError(response.StatusCode, responseBody))
+                    {
+                        _logger.LogInformation(
+                            "[SerenityExecuteReadinessRetry] Attempt={Attempt}/{MaxAttempts} StatusCode={StatusCode} KnowledgeId={KnowledgeId}",
+                            attempt,
+                            ExecuteReadinessMaxAttempts,
+                            (int)response.StatusCode,
+                            knowledgeId);
+                        await Task.Delay(ExecuteReadinessRetryDelay, cancellationToken);
+                        continue;
+                    }
+
+                    await EnsureSuccessOrThrowAsync(response, "Execute", responseBody, cancellationToken);
+                }
+
+                JsonDocument outer;
+                try
+                {
+                    outer = JsonDocument.Parse(responseBody);
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogWarning(ex, "[SerenityExecuteParseFailure] BodySnippet={BodySnippet}", TruncateForLog(responseBody));
+                    throw new InvalidOperationException(GenericPreviewFailureMessage, ex);
+                }
+
+                using (outer)
+                {
+                    if (outer.RootElement.TryGetProperty("jsonContent", out var jsonContentElement)
+                        && jsonContentElement.ValueKind == JsonValueKind.Object)
+                    {
+                        return (JsonDocument.Parse(jsonContentElement.GetRawText()), responseBody);
+                    }
+
+                    if (outer.RootElement.TryGetProperty("content", out var contentElement)
+                        && contentElement.ValueKind == JsonValueKind.String)
+                    {
+                        var content = contentElement.GetString();
+                        if (!string.IsNullOrWhiteSpace(content))
+                        {
+                            try
+                            {
+                                return (JsonDocument.Parse(content), responseBody);
+                            }
+                            catch (JsonException ex)
+                            {
+                                _logger.LogWarning(ex, "[SerenityExecuteContentParseFailure] BodySnippet={BodySnippet}", TruncateForLog(content));
+                                throw new InvalidOperationException(GenericPreviewFailureMessage, ex);
+                            }
+                        }
+                    }
+                }
+
+                throw new InvalidOperationException("Unable to analyze one or more invoices. Serenity response did not include parseable analysis content.");
             }
         }
 
-        throw new InvalidOperationException("Serenity analysis response did not include jsonContent or parsable content.");
+        throw new InvalidOperationException(GenericPreviewFailureMessage);
     }
 
     private static InvoiceEditorDto BuildEditorDto(IFormFile file, JsonElement analysis, string rawResponse)
@@ -227,5 +324,84 @@ public class SerenityInvoiceAgentService : ISerenityInvoiceAgentService
         return Environment.GetEnvironmentVariable(ApiKeyEnvironmentName)
             ?? _configuration[ApiKeyEnvironmentName]
             ?? throw new InvalidOperationException($"{ApiKeyEnvironmentName} environment variable is not configured.");
+    }
+
+    private async Task EnsureSuccessOrThrowAsync(HttpResponseMessage response, string operation, CancellationToken cancellationToken)
+    {
+        var body = await SafeReadBodyAsync(response, cancellationToken);
+        await EnsureSuccessOrThrowAsync(response, operation, body, cancellationToken);
+    }
+
+    private async Task EnsureSuccessOrThrowAsync(HttpResponseMessage response, string operation, string responseBody, CancellationToken cancellationToken)
+    {
+        if (response.IsSuccessStatusCode)
+        {
+            return;
+        }
+
+        _ = cancellationToken;
+        var bodySnippet = TruncateForLog(responseBody);
+
+        _logger.LogWarning(
+            "[Serenity{Operation}Failure] StatusCode={StatusCode} BodySnippet={BodySnippet}",
+            operation,
+            (int)response.StatusCode,
+            bodySnippet);
+
+        var statusCode = response.StatusCode;
+        if ((int)statusCode >= 400
+            && (int)statusCode < 500
+            && statusCode != HttpStatusCode.RequestTimeout
+            && statusCode != HttpStatusCode.TooManyRequests)
+        {
+            throw new InvalidOperationException(GenericPreviewFailureMessage);
+        }
+
+        throw new HttpRequestException($"Serenity {operation.ToLowerInvariant()} request failed with status {(int)statusCode} ({statusCode}).");
+    }
+
+    private static async Task<string> SafeReadBodyAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await response.Content.ReadAsStringAsync(cancellationToken);
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string TruncateForLog(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var trimmed = value.Trim();
+        return trimmed.Length <= MaxBodySnippetLength
+            ? trimmed
+            : $"{trimmed[..MaxBodySnippetLength]}...(truncated)";
+    }
+
+    private static bool IsTransientExecuteReadinessError(HttpStatusCode statusCode, string responseBody)
+    {
+        if (statusCode != HttpStatusCode.BadRequest)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(responseBody))
+        {
+            return false;
+        }
+
+        var normalized = responseBody.ToLowerInvariant();
+        return normalized.Contains("volatileknowledge")
+            || normalized.Contains("volatile knowledge")
+            || normalized.Contains("knowledge id")
+            || normalized.Contains("not found")
+            || normalized.Contains("not ready");
     }
 }

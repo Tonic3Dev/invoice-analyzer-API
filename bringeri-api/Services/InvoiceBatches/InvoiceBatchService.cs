@@ -18,17 +18,23 @@ public class InvoiceBatchService : IInvoiceBatchService
     private readonly ITenantProvider _tenantProvider;
     private readonly ISerenityInvoiceAgentService _serenityInvoiceAgentService;
     private readonly IMapper _mapper;
+    private readonly ILogger<InvoiceBatchService> _logger;
+    private readonly IHttpContextAccessor _httpContextAccessor;
 
     public InvoiceBatchService(
         AppDbContext db,
         ITenantProvider tenantProvider,
         ISerenityInvoiceAgentService serenityInvoiceAgentService,
-        IMapper mapper)
+        IMapper mapper,
+        ILogger<InvoiceBatchService> logger,
+        IHttpContextAccessor httpContextAccessor)
     {
         _db = db;
         _tenantProvider = tenantProvider;
         _serenityInvoiceAgentService = serenityInvoiceAgentService;
         _mapper = mapper;
+        _logger = logger;
+        _httpContextAccessor = httpContextAccessor;
     }
 
     public async Task<InvoiceBatchPreviewDto> PreviewAsync(string? title, IReadOnlyList<IFormFile> files, CancellationToken cancellationToken = default)
@@ -36,10 +42,60 @@ public class InvoiceBatchService : IInvoiceBatchService
         EnsureTenant();
         EnsureFiles(files);
 
+        var correlationId = _httpContextAccessor.HttpContext?.TraceIdentifier ?? "n/a";
+        var tenantSlug = _tenantProvider.TenantSlug ?? "unknown";
+
+        _logger.LogInformation(
+            "[PreviewRequested] CorrelationId={CorrelationId} Tenant={Tenant} FileCount={FileCount}",
+            correlationId,
+            tenantSlug,
+            files.Count);
+
         var invoices = new List<InvoiceEditorDto>(files.Count);
-        foreach (var file in files)
+        for (var index = 0; index < files.Count; index++)
         {
-            invoices.Add(await _serenityInvoiceAgentService.AnalyzeInvoiceAsync(file, cancellationToken));
+            var file = files[index];
+
+            _logger.LogInformation(
+                "[PreviewAnalyzeStart] CorrelationId={CorrelationId} Tenant={Tenant} FileIndex={FileIndex} FileName={FileName} FileSize={FileSize}",
+                correlationId,
+                tenantSlug,
+                index,
+                file.FileName,
+                file.Length);
+
+            try
+            {
+                invoices.Add(await _serenityInvoiceAgentService.AnalyzeInvoiceAsync(file, cancellationToken));
+                _logger.LogInformation(
+                    "[PreviewAnalyzeSuccess] CorrelationId={CorrelationId} Tenant={Tenant} FileIndex={FileIndex} FileName={FileName}",
+                    correlationId,
+                    tenantSlug,
+                    index,
+                    file.FileName);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "[PreviewAnalyzeFailure] CorrelationId={CorrelationId} Tenant={Tenant} FileIndex={FileIndex} FileName={FileName}",
+                    correlationId,
+                    tenantSlug,
+                    index,
+                    file.FileName);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "[PreviewAnalyzeUnhandled] CorrelationId={CorrelationId} Tenant={Tenant} FileIndex={FileIndex} FileName={FileName}",
+                    correlationId,
+                    tenantSlug,
+                    index,
+                    file.FileName);
+                throw;
+            }
         }
 
         return new InvoiceBatchPreviewDto

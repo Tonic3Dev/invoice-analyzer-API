@@ -67,11 +67,13 @@ builder.Services.AddScoped<ITenantProvider, TenantProvider>();
 builder.Services.AddScoped<IAuthService, AuthService>();
 builder.Services.AddScoped<ITenantService, TenantService>();
 builder.Services.AddScoped<IInvoiceBatchService, InvoiceBatchService>();
+builder.Services.AddTransient<SerenityTransientRetryHandler>();
 builder.Services.AddHttpClient<ISerenityInvoiceAgentService, SerenityInvoiceAgentService>(client =>
 {
     client.BaseAddress = new Uri(builder.Configuration["Serenity:BaseUrl"] ?? "https://api.serenitystar.ai/api/v2/");
     client.Timeout = TimeSpan.FromMinutes(3);
-});
+})
+.AddHttpMessageHandler<SerenityTransientRetryHandler>();
 builder.Services.AddAutoMapper(_ => { }, typeof(MappingProfile).Assembly);
 
 builder.Services.AddControllers()
@@ -133,20 +135,26 @@ app.UseExceptionHandler(errorApp =>
 {
     errorApp.Run(async context =>
     {
+        var correlationId = context.TraceIdentifier;
+
         context.Response.StatusCode = 500;
         context.Response.ContentType = "application/json";
         context.Response.Headers["Access-Control-Allow-Origin"] = "*";
+        context.Response.Headers["X-Correlation-ID"] = correlationId;
 
         var feature = context.Features.Get<Microsoft.AspNetCore.Diagnostics.IExceptionHandlerFeature>();
-        var message = feature?.Error?.Message ?? "An internal server error occurred.";
 
         var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
         if (feature?.Error != null)
         {
-            logger.LogError(feature.Error, "[UnhandledException] {Path}", context.Request.Path);
+            logger.LogError(feature.Error, "[UnhandledException] {Path} CorrelationId={CorrelationId}", context.Request.Path, correlationId);
         }
 
-        await context.Response.WriteAsJsonAsync(new { message });
+        await context.Response.WriteAsJsonAsync(new
+        {
+            message = "Unable to process the request right now. Please retry.",
+            correlationId,
+        });
     });
 });
 
